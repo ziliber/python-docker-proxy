@@ -1,0 +1,11 @@
+[project]
+name = "docker-p"
+version = "0.1.0"
+description = "Add your description here"
+readme = "README.md"
+requires-python = ">=3.11"
+dependencies = [
+    "aiohttp[speedups]>=3.11.13",
+    "pydantic>=2.10.6",
+    "pydantic-settings>=2.8.1",
+]
