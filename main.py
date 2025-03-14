@@ -1,9 +1,10 @@
+from contextlib import asynccontextmanager
 import logging
 import re
 from typing import Optional
 
 from pydantic_settings import BaseSettings, SettingsConfigDict
-from aiohttp import ClientSession, web
+from aiohttp import ClientSession, ClientTimeout, web
 from yarl import URL
 
 
@@ -41,28 +42,6 @@ logging.basicConfig(
 
 DockerHub = "https://registry-1.docker.io"
 
-routes = {
-    # production
-    "docker": DockerHub,
-    "quay": "https://quay.io",
-    "gcr": "https://gcr.io",
-    "k8s-gcr": "https://k8s.gcr.io",
-    "k8s": "https://registry.k8s.io",
-    "ghcr": "https://ghcr.io",
-    "cloudsmith": "https://docker.cloudsmith.io",
-    "ecr": "https://public.ecr.aws",
-    # staging
-    "docker-staging": DockerHub,
-}
-
-session: ClientSession
-
-
-def route_by_hosts(host):
-    if host in routes:
-        return routes[host]
-    return DockerHub
-
 
 def parseAuthenticate(authenticateStr):
     # sample: Bearer realm="https://auth.ipv6.docker.com/token",service="registry.docker.io"
@@ -77,6 +56,7 @@ def parseAuthenticate(authenticateStr):
     }
 
 
+@asynccontextmanager
 async def fetch_token(www_authenticate, scope, authorization):
     url = www_authenticate["realm"]
     params = {}
@@ -88,7 +68,7 @@ async def fetch_token(www_authenticate, scope, authorization):
     if authorization:
         headers["Authorization"] = authorization
     async with session.get(url, params=params, headers=headers) as resp:
-        return await resp.read()
+        yield resp
 
 
 def response_unauthorized(url: URL):
@@ -100,9 +80,24 @@ def response_unauthorized(url: URL):
 
 async def handle_request(request: web.Request):
     url = request.url
-    upstream = route_by_hosts(url.host.split(".")[0])  # type: ignore
-    if upstream == "":
-        return web.json_response({"routes": routes}, status=404)
+    upstream = DockerHub
+    scope = request.query.get("scope", "")
+    path = url.path
+    if url.parts[1] == "v2" and url.parts[2].find(".") != -1:
+        upstream = "https://" + url.parts[2]
+        path = "/v2/" + "/".join(url.parts[3:])
+    if scope:
+        scope_parts = scope.split(":")
+        if len(scope_parts) == 3:
+            s = scope_parts[1].split("/")
+            if "." in s[0]:
+                upstream = "https://" + s[0]
+                del s[0]
+                scope_parts[1] = "/".join(s)
+                scope = ":".join(scope_parts)
+
+    logger.info(f"Request: {url}, upstream: {upstream}")
+
     is_docker_hub = upstream == DockerHub
     authorization = request.headers.get("Authorization")
 
@@ -131,14 +126,20 @@ async def handle_request(request: web.Request):
                     body=await resp.read(), status=resp.status, headers=resp.headers
                 )
             www_authenticate = parseAuthenticate(authenticate_str)
-            scope = request.query.get("scope")
             if scope and is_docker_hub:
-                scopeParts = scope.split(":")
-                if len(scopeParts) == 3 and "/" not in scopeParts[1]:
-                    scopeParts[1] = f"library/{scopeParts[1]}"
-                    scope = ":".join(scopeParts)
-            token_resp = await fetch_token(www_authenticate, scope, authorization)
-            return web.Response(body=token_resp)
+                scope_parts = scope.split(":")
+                if len(scope_parts) == 3 and "/" not in scope_parts[1]:
+                    scope_parts[1] = f"library/{scope_parts[1]}"
+                    scope = ":".join(scope_parts)
+            async with fetch_token(
+                www_authenticate, scope, authorization
+            ) as token_resp:
+                resp_data = await token_resp.read()
+                return web.Response(
+                    body=resp_data,
+                    status=token_resp.status,
+                    content_type=token_resp.content_type,
+                )
 
     if is_docker_hub:
         path_parts = url.path.split("/")
@@ -147,34 +148,35 @@ async def handle_request(request: web.Request):
             redirect_url = url.with_path("/".join(path_parts))
             return web.HTTPMovedPermanently(location=str(redirect_url))
 
-    new_url = f"{upstream}{url.path}"
+    new_url = f"{upstream}{path}"
     headers = request.headers.copy()
     del headers["Host"]
-    async with session.request(request.method, new_url, headers=headers) as resp:
-        if resp.status == 401:
-            return response_unauthorized(url)
-        if is_docker_hub and resp.status == 307 and "Location":
-            location = resp.headers.get("Location")
-            if location:
-                async with session.get(location) as redirect_resp:
-                    return web.Response(
-                        body=await redirect_resp.read(),
-                        status=redirect_resp.status,
-                        headers=redirect_resp.headers,
-                    )
-        return web.Response(
-            body=await resp.read(), status=resp.status, headers=resp.headers
-        )
+    resp = await session.request(request.method, new_url, headers=headers)
+    if resp.status == 401:
+        return response_unauthorized(url)
+    if is_docker_hub and resp.status == 307 and "Location":
+        location = resp.headers.get("Location")
+        if location:
+            async with session.get(location) as redirect_resp:
+                return web.Response(
+                    body=await redirect_resp.read(),
+                    status=redirect_resp.status,
+                    headers=redirect_resp.headers,
+                )
+
+    return web.Response(body=resp.content, status=resp.status, headers=resp.headers)
 
 
 async def main():
     global session
-    session = ClientSession(proxy=settings.PROXY)
-    app = web.Application()
+    session = ClientSession(
+        proxy=settings.PROXY, timeout=ClientTimeout(total=10 * 60, sock_connect=30)
+    )
+    app = web.Application(client_max_size=100 << 20)
     app.router.add_routes([web.route("*", "/{path:.*}", handle_request)])
     logger.info(f"Server started at http://{settings.HOST}:{settings.PORT}")
     return app
 
 
 if __name__ == "__main__":
-    web.run_app(app=main(), host=settings.HOST, port=settings.PORT)
+    web.run_app(app=main(), host=settings.HOST, port=settings.PORT, access_log=None)
